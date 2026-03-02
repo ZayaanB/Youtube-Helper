@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 from typing import Dict, Optional
 
@@ -27,6 +28,28 @@ MODEL_CHOICES: Dict[str, str] = {
     "Standard check (recommended)": "meta-llama/llama-3.3-70b-instruct:free",
     "Quick check": "openai/gpt-4.1-mini",
 }
+
+def yt_dlp_options() -> Dict:
+    opts: Dict = {
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+
+    runtime = os.getenv("YTDLP_JS_RUNTIME")
+    if runtime:
+        opts["js_runtimes"] = runtime
+        return opts
+
+    if shutil.which("node"):
+        opts["js_runtimes"] = "node"
+        return opts
+
+    if shutil.which("deno"):
+        opts["js_runtimes"] = "deno"
+        return opts
+
+    return opts
 
 
 def get_thumbnail_url(info: Dict) -> Optional[str]:
@@ -58,8 +81,7 @@ def get_thumbnail_url(info: Dict) -> Optional[str]:
 
 def get_video_info(url: str) -> Optional[Dict]:
     try:
-        ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(yt_dlp_options()) as ydl:
             info = ydl.extract_info(url, download=False)
             info["thumbnail_resolved"] = get_thumbnail_url(info)
             return info
@@ -208,32 +230,49 @@ def search_youtube_videos(
     target_minutes: Optional[int] = None,
     tolerance_minutes: int = 5,
 ) -> list[Dict]:
-    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
     search_query = f"ytsearch{max_results}:{query}"
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(yt_dlp_options()) as ydl:
         info = ydl.extract_info(search_query, download=False)
 
     entries = info.get("entries") or []
-    results: list[Dict] = []
+    videos: list[Dict] = []
 
     for entry in entries:
-        duration = entry.get("duration")
-        duration_minutes = round(duration / 60) if duration else None
+        duration_seconds = entry.get("duration")
+        duration_minutes = None
+        if duration_seconds:
+            duration_minutes = int(round(duration_seconds / 60))
 
-        if target_minutes is not None and duration_minutes is not None:
-            if abs(duration_minutes - target_minutes) > tolerance_minutes:
-                continue
-
-        results.append(
+        videos.append(
             {
                 "title": entry.get("title") or "",
                 "channel": entry.get("uploader") or entry.get("channel") or "",
                 "duration_minutes": duration_minutes,
+                "duration_seconds": duration_seconds,
                 "url": entry.get("webpage_url") or entry.get("url"),
             }
         )
 
-    return results
+    if target_minutes is None:
+        return videos
+
+    target_seconds = target_minutes * 60
+    tolerance_seconds = tolerance_minutes * 60
+
+    within: list[Dict] = []
+    unknown: list[Dict] = []
+
+    for video in videos:
+        duration_seconds = video.get("duration_seconds")
+        if duration_seconds is None:
+            unknown.append(video)
+            continue
+
+        if abs(duration_seconds - target_seconds) <= tolerance_seconds:
+            within.append(video)
+
+    within.sort(key=lambda v: abs(v["duration_seconds"] - target_seconds))
+    return within + unknown
 
 
 def prompt_int(prompt: str, default: int, min_value: int, max_value: int) -> int:
@@ -346,8 +385,14 @@ def run_recommendation_flow() -> None:
 
     print("\nSearching YouTube for matching videos...")
     try:
+        search_pool = max(30, max_results * 20)
+        if search_pool > 80:
+            search_pool = 80
         videos = search_youtube_videos(
-            search_query, max_results=max_results * 2, target_minutes=target_minutes
+            search_query,
+            max_results=search_pool,
+            target_minutes=target_minutes,
+            tolerance_minutes=5,
         )
     except Exception as exc:
         print(f"Could not search for videos: {exc}")
@@ -361,10 +406,10 @@ def run_recommendation_flow() -> None:
         return
 
     print("\nRecommended videos:")
-    shown = 0
-    for idx, video in enumerate(videos, start=1):
-        if shown >= max_results:
-            break
+    shown_count = len(videos[:max_results])
+    if shown_count < max_results:
+        print(f"(Only found {shown_count} close matches within ±5 minutes.)")
+    for idx, video in enumerate(videos[:max_results], start=1):
         title = video.get("title") or "Untitled"
         channel = video.get("channel") or ""
         duration = video.get("duration_minutes")
@@ -378,8 +423,6 @@ def run_recommendation_flow() -> None:
         else:
             print("   Length  : unknown")
         print(f"   URL     : {url}")
-        shown += 1
-
     print(
         "\nYou can copy any of these URLs and run the "
         "'Analyze a specific YouTube video' option to get a full clickbait check."
@@ -810,10 +853,14 @@ def launch_gui() -> None:
         root.update_idletasks()
 
         try:
+            search_pool = max(30, max_results * 20)
+            if search_pool > 80:
+                search_pool = 80
             videos = search_youtube_videos(
                 search_query,
-                max_results=max_results * 2,
+                max_results=search_pool,
                 target_minutes=target_minutes,
+                tolerance_minutes=5,
             )
         except Exception as exc:
             messagebox.showerror("Search error", f"Could not search for videos: {exc}")
@@ -828,10 +875,13 @@ def launch_gui() -> None:
             return
 
         reco_box.delete("1.0", "end")
-        shown = 0
-        for idx, video in enumerate(videos, start=1):
-            if shown >= max_results:
-                break
+        shown_count = len(videos[:max_results])
+        if shown_count < max_results:
+            reco_box.insert(
+                "end",
+                f"Only found {shown_count} close matches within ±5 minutes. Showing what I could.\n\n",
+            )
+        for idx, video in enumerate(videos[:max_results], start=1):
             title = video.get("title") or "Untitled"
             channel = video.get("channel") or ""
             duration = video.get("duration_minutes")
@@ -845,7 +895,6 @@ def launch_gui() -> None:
             else:
                 reco_box.insert("end", "   Length  : unknown\n")
             reco_box.insert("end", f"   URL     : {url}\n\n")
-            shown += 1
 
         reco_box.insert(
             "end",

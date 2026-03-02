@@ -45,6 +45,12 @@ On some Linux systems you may also need the Tk GUI toolkit for the window to sta
 sudo apt install python3-tk
 ```
 
+If `yt-dlp` prints warnings about a missing JavaScript runtime or `ffmpeg`, install these (recommended):
+
+```bash
+sudo apt install nodejs ffmpeg
+```
+
 ### 2. Configure your environment
 
 Set your OpenRouter API key so Youtube Helper can ask the model to score videos. You can either:
