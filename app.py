@@ -1,7 +1,8 @@
 import os
 import shutil
 import sys
-from typing import Dict, Optional
+import threading
+from typing import Dict, List, Optional
 
 import requests
 from youtube_transcript_api import (
@@ -25,28 +26,32 @@ def has_api_key() -> bool:
 
 
 MODEL_CHOICES: Dict[str, str] = {
-    "Standard check (recommended)": "meta-llama/llama-3.3-70b-instruct:free",
-    "Quick check": "openai/gpt-4.1-mini",
+    "Standard check (free)": "meta-llama/llama-3.3-70b-instruct:free",
 }
 
 def yt_dlp_options() -> Dict:
     opts: Dict = {
         "quiet": True,
+        "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "socket_timeout": 30,
     }
 
     runtime = os.getenv("YTDLP_JS_RUNTIME")
     if runtime:
-        opts["js_runtimes"] = runtime
+        path = shutil.which(runtime)
+        opts["js_runtimes"] = {runtime: {"path": path}}
         return opts
 
-    if shutil.which("node"):
-        opts["js_runtimes"] = "node"
+    node_path = shutil.which("node")
+    if node_path:
+        opts["js_runtimes"] = {"node": {"path": node_path}}
         return opts
 
-    if shutil.which("deno"):
-        opts["js_runtimes"] = "deno"
+    deno_path = shutil.which("deno")
+    if deno_path:
+        opts["js_runtimes"] = {"deno": {"path": deno_path}}
         return opts
 
     return opts
@@ -230,7 +235,8 @@ def search_youtube_videos(
     target_minutes: Optional[int] = None,
     tolerance_minutes: int = 5,
 ) -> list[Dict]:
-    search_query = f"ytsearch{max_results}:{query}"
+    fetch_count = min(20, max(10, max_results * 2))
+    search_query = f"ytsearch{fetch_count}:{query}"
     with yt_dlp.YoutubeDL(yt_dlp_options()) as ydl:
         info = ydl.extract_info(search_query, download=False)
 
@@ -368,8 +374,8 @@ def run_recommendation_flow() -> None:
         print("Please describe what you're in the mood for.")
         return
 
-    user_background = input(
-        "Tell me a little about you (optional): "
+    input(
+        "Tell me a little about you: "
     ).strip()
     target_minutes = prompt_int(
         "Roughly how long should each video be (minutes)?", 20, 3, 120
@@ -378,19 +384,13 @@ def run_recommendation_flow() -> None:
         "How many suggestions would you like?", 5, 1, 10
     )
 
-    if user_background:
-        search_query = f"{mood} for {user_background}"
-    else:
-        search_query = mood
+    search_query = mood
 
     print("\nSearching YouTube for matching videos...")
     try:
-        search_pool = max(30, max_results * 20)
-        if search_pool > 80:
-            search_pool = 80
         videos = search_youtube_videos(
             search_query,
-            max_results=search_pool,
+            max_results=20,
             target_minutes=target_minutes,
             tolerance_minutes=5,
         )
@@ -668,35 +668,51 @@ def launch_gui() -> None:
     )
     result_box.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
 
+    def apply_analyze_results(
+        video_ctx: Optional[Dict],
+        analysis: Optional[str],
+        error: Optional[BaseException],
+    ) -> None:
+        analyze_button.configure(state="normal")
+        if error is not None:
+            msg = "Analysis was cancelled." if isinstance(error, KeyboardInterrupt) else str(error)
+            messagebox.showerror("Analysis error", f"Could not analyze this video: {msg}")
+            result_box.delete("1.0", "end")
+            result_box.insert("end", "Analysis was cancelled or failed. Try again when ready.\n")
+            return
+        if not video_ctx or not analysis:
+            messagebox.showerror(
+                "Video error",
+                "Could not load video metadata. Please check the URL and try again.",
+            )
+            result_box.delete("1.0", "end")
+            return
+        result_box.delete("1.0", "end")
+        header_lines = [
+            f"Title  : {video_ctx.get('title') or 'Unknown'}",
+            f"Channel: {video_ctx.get('channel') or 'Unknown'}",
+        ]
+        if video_ctx.get("duration_minutes") is not None:
+            header_lines.append(f"Length : ~{video_ctx['duration_minutes']} min")
+        header_lines.append(f"URL    : {video_ctx.get('webpage_url')}")
+        result_box.insert("end", "\n".join(header_lines))
+        result_box.insert("end", "\n\n=== Clickbait analysis & meal-time verdict ===\n\n")
+        result_box.insert("end", analysis)
+
     def on_analyze_click() -> None:
         url = url_var.get().strip()
         if not url:
             messagebox.showerror("Missing URL", "Please paste a YouTube video link first.")
             return
-
         user_background = about_text.get("1.0", "end").strip()
         user_interests = mood_text.get("1.0", "end").strip()
         meal_minutes = meal_var.get()
         clickbait_tolerance = tol_var.get()
         selected_model_label = model_var.get()
         model = MODEL_CHOICES.get(selected_model_label)
-
         if model is None:
             messagebox.showerror("Model error", "Please choose a valid analysis style.")
             return
-
-        result_box.delete("1.0", "end")
-        result_box.insert("end", "Fetching video details and transcript...\n")
-        root.update_idletasks()
-
-        video_ctx = build_video_context(url)
-        if not video_ctx:
-            messagebox.showerror(
-                "Video error",
-                "Could not load video metadata. Please check the URL and try again.",
-            )
-            return
-
         if not has_api_key():
             messagebox.showerror(
                 "Configuration",
@@ -704,35 +720,32 @@ def launch_gui() -> None:
             )
             return
 
-        result_box.insert("end", "\nAnalyzing video...\n")
-        root.update_idletasks()
-
-        try:
-            analysis = analyze_video_with_openrouter(
-                model,
-                video_ctx,
-                user_background,
-                user_interests,
-                meal_minutes,
-                clickbait_tolerance,
-            )
-        except Exception as exc:
-            messagebox.showerror("Analysis error", f"Could not analyze this video: {exc}")
-            return
-
         result_box.delete("1.0", "end")
-        header_lines = [
-            f"Title  : {video_ctx.get('title') or 'Unknown'}",
-            f"Channel: {video_ctx.get('channel') or 'Unknown'}",
-        ]
-        if video_ctx.get("duration_minutes") is not None:
-            header_lines.append(
-                f"Length : ~{video_ctx['duration_minutes']} min",
-            )
-        header_lines.append(f"URL    : {video_ctx.get('webpage_url')}")
-        result_box.insert("end", "\n".join(header_lines))
-        result_box.insert("end", "\n\n=== Clickbait analysis & meal-time verdict ===\n\n")
-        result_box.insert("end", analysis)
+        result_box.insert("end", "Fetching video details and transcript...\n")
+        analyze_button.configure(state="disabled")
+
+        def work() -> None:
+            err: Optional[BaseException] = None
+            ctx: Optional[Dict] = None
+            analysis_text: Optional[str] = None
+            try:
+                ctx = build_video_context(url)
+                if not ctx:
+                    root.after(0, lambda: apply_analyze_results(None, None, None))
+                    return
+                analysis_text = analyze_video_with_openrouter(
+                    model,
+                    ctx,
+                    user_background,
+                    user_interests,
+                    meal_minutes,
+                    clickbait_tolerance,
+                )
+            except (KeyboardInterrupt, Exception) as e:
+                err = e
+            root.after(0, lambda: apply_analyze_results(ctx, analysis_text, err))
+
+        threading.Thread(target=work, daemon=True).start()
 
     analyze_button.configure(command=on_analyze_click)
 
@@ -759,7 +772,7 @@ def launch_gui() -> None:
 
     about_label2 = ttk.Label(
         recommend_left,
-        text="About you (optional):",
+        text="About you (optional; used only to break ties between similar options):",
         style="Dark.TLabel",
     )
     about_label2.grid(row=2, column=0, sticky="w", padx=5, pady=(4, 2))
@@ -830,42 +843,17 @@ def launch_gui() -> None:
     )
     reco_box.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
 
-    def on_recommend_click() -> None:
-        mood = mood_var2.get().strip()
-        if not mood:
-            messagebox.showerror(
-                "Missing description",
-                "Please describe what you're in the mood for.",
-            )
+    def apply_recommend_results(
+        videos: Optional[List[Dict]], error: Optional[BaseException], n: int
+    ) -> None:
+        recommend_button.configure(state="normal")
+        if error is not None:
+            msg = "Search was cancelled." if isinstance(error, KeyboardInterrupt) else str(error)
+            messagebox.showerror("Search error", f"Could not search for videos: {msg}")
+            reco_box.delete("1.0", "end")
+            reco_box.insert("end", "Search was cancelled or failed. Try again when ready.\n")
             return
-
-        user_background = about_var2.get().strip()
-        target_minutes = target_var.get()
-        max_results = count_var.get()
-
-        if user_background:
-            search_query = f"{mood} for {user_background}"
-        else:
-            search_query = mood
-
         reco_box.delete("1.0", "end")
-        reco_box.insert("end", "Searching YouTube for matching videos...\n")
-        root.update_idletasks()
-
-        try:
-            search_pool = max(30, max_results * 20)
-            if search_pool > 80:
-                search_pool = 80
-            videos = search_youtube_videos(
-                search_query,
-                max_results=search_pool,
-                target_minutes=target_minutes,
-                tolerance_minutes=5,
-            )
-        except Exception as exc:
-            messagebox.showerror("Search error", f"Could not search for videos: {exc}")
-            return
-
         if not videos:
             reco_box.insert(
                 "end",
@@ -873,20 +861,17 @@ def launch_gui() -> None:
                 "Try broadening your description or loosening the length requirement.",
             )
             return
-
-        reco_box.delete("1.0", "end")
-        shown_count = len(videos[:max_results])
-        if shown_count < max_results:
+        shown_count = len(videos[:n])
+        if shown_count < n:
             reco_box.insert(
                 "end",
                 f"Only found {shown_count} close matches within ±5 minutes. Showing what I could.\n\n",
             )
-        for idx, video in enumerate(videos[:max_results], start=1):
+        for idx, video in enumerate(videos[:n], start=1):
             title = video.get("title") or "Untitled"
             channel = video.get("channel") or ""
             duration = video.get("duration_minutes")
             url = video.get("url") or ""
-
             reco_box.insert("end", f"{idx}. {title}\n")
             if channel:
                 reco_box.insert("end", f"   Channel : {channel}\n")
@@ -895,12 +880,43 @@ def launch_gui() -> None:
             else:
                 reco_box.insert("end", "   Length  : unknown\n")
             reco_box.insert("end", f"   URL     : {url}\n\n")
-
         reco_box.insert(
             "end",
             "You can copy any of these URLs into the 'Analyze video' tab "
             "to get a full clickbait score and meal-time verdict.\n",
         )
+
+    def on_recommend_click() -> None:
+        mood = mood_var2.get().strip()
+        if not mood:
+            messagebox.showerror(
+                "Missing description",
+                "Please describe what you're in the mood for.",
+            )
+            return
+        target_minutes = target_var.get()
+        max_results = count_var.get()
+        search_query = mood
+
+        reco_box.delete("1.0", "end")
+        reco_box.insert("end", "Searching YouTube for matching videos...\n")
+        recommend_button.configure(state="disabled")
+
+        def work() -> None:
+            err: Optional[BaseException] = None
+            out: Optional[List[Dict]] = None
+            try:
+                out = search_youtube_videos(
+                    search_query,
+                    max_results=20,
+                    target_minutes=target_minutes,
+                    tolerance_minutes=5,
+                )
+            except (KeyboardInterrupt, Exception) as e:
+                err = e
+            root.after(0, lambda: apply_recommend_results(out, err, max_results))
+
+        threading.Thread(target=work, daemon=True).start()
 
     recommend_button.configure(command=on_recommend_click)
 
