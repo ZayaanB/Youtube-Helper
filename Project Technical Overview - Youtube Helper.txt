@@ -1,0 +1,27 @@
+﻿Zayaan Bhanwadia
+Youtube Helper - Clickbait and Reccomendations Overview
+
+Purpose 
+The core problem is meal-time indecision: you sit down to eat, open YouTube, and spend too long doomscrolling scrolling instead of watching something entertaining and eating. This project tries to cut that down to a few seconds by doing two things:
+- If you already have a link: quickly judge clickbait rating and give a meal-time verdict.
+- If you don’t have a link: suggest a small list of videos that match your mood and your time box.
+
+Running Locally
+install the packages in requirements.txt, and on Linux you may need python3-tk to enable tkinter.
+There’s also a CLI fallback (python app.py --cli) for systems where the GUI can’t start or when you just prefer the terminal.
+
+External services used
+The app uses three main external APIs:
+- OpenRouter Chat Completions API (https://openrouter.ai): used to generate the clickbait score and meal-time verdict using AI model (free model is the standard for this app).
+- yt-dlp: used to fetch YouTube metadata and also to search YouTube by text.
+- youtube-transcript-api: used to fetch transcripts when available (English preferred).
+
+Recommendation mode (searching for videos)
+In recommendation mode, the app turns your ‘mood’ text (and optional background) into a search, then uses yt-dlp’s ytsearch. It fetches a larger pool of results first, in this case 30 videos, then filters them so you still get the number of suggestions you asked for.
+Duration filtering is lenient by design: if you ask for a 20-minute video, it will accept anything within +/-5 minutes. Results are sorted so the closest durations show up first.
+
+Limitations
+- Recommendations depend on YouTube search results; sometimes the best match just isn’t in the top results.
+- Transcripts aren’t available for every video, so the analysis may fall back to descriptions or just use the title in the worst case and make an assumption (work in progress).
+- The clickbait score is a judgment call. The rubric helps, but it’s still an AI opinion.
+
