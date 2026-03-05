@@ -1,8 +1,8 @@
-## Youtube Helper - Clickbait and Reccomendations
+## Youtube Helper - Clickbait and Recommendations
 
 Problem: You sit down with a plate of food, open YouTube, and suddenly 10 minutes disappear to scrolling instead of eating. The food gets cold, and the “perfect” video never appears.
 
-Youtube Helper helps you decide in seconds whether a video is actually worth your meal-time — and, when you don’t have a specific link in mind, it can suggest a handful of options that fit your mood and time box.
+YouTube Helper helps you decide in seconds whether a video is actually worth your mealtime — and, when you don’t have a specific link in mind, it can suggest a handful of options that fit your mood and time box.
 
 - Paste a YouTube link and get a clickbait / meal-time verdict.
 - Or, tell it what you’re in the mood for and how long you want to watch, and get a short list of suggested videos.
@@ -12,18 +12,23 @@ Youtube Helper helps you decide in seconds whether a video is actually worth you
 
 ## How it works
 
-- Transcript + description aware: The app pulls the video transcript when available (via `youtube-transcript-api`), and falls back to the video description when it is not.
-- Lightweight video context: It keeps only the bits of text the model needs so responses stay fast and focused instead of getting bogged down in huge transcripts.
+- Transcript + description: The app pulls the video transcript when available (via `youtube-transcript-api`).
 - OpenRouter-powered analysis: Instead of a local model, the app calls OpenRouter’s chat API to rate how clickbaity the title is and whether the content delivers.
-- You in the loop: It uses your background, current interests, meal length, and clickbait tolerance to give a verdict tailored to *you* right now.
-- Recommendation mode: When you don’t have a specific link handy, it uses `yt-dlp`’s search to find a few videos that fit your mood and roughly match your desired length.
+- Uses the user's background, current interests, meal length, and clickbait tolerance to give a verdict tailored to *the user* right now.
+- Recommendation mode: When you don’t have a specific link handy, it uses `yt-dlp`’s search to find a number of videos (specified by the user) that fit your mood and roughly match the desired length.
 
 The model responds with:
 
+Mode 1 (Evaluate video):
 - A short summary of the video
-- A 1–10 clickbait score using a clear rubric
-- Concrete reasons for the score
+- A 1–10 clickbait score using a predefined rubric (found in app.py in prompt)
+- Concrete reasons for the score based on the rubric and evidence from the transcript (if applicable)
 - A meal-time verdict: should you watch this while eating, or look for something better?
+
+Mode 2 (Find videos):
+- Links to #videos defined by the user
+- Video titles
+- Video durations
 
 ---
 
@@ -39,21 +44,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On some Linux systems you may also need the Tk GUI toolkit for the window to start:
+On some Linux systems, you may also need the Tk GUI toolkit for the window to start:
 
 ```bash
 sudo apt install python3-tk
 ```
-
-If `yt-dlp` prints warnings about a missing JavaScript runtime or `ffmpeg`, install these (recommended):
-
-```bash
-sudo apt install nodejs ffmpeg
 ```
 
 ### 2. Configure your environment
 
-Set your OpenRouter API key so Youtube Helper can ask the model to score videos. You can either:
+Set your OpenRouter API key so the YouTube Helper can ask the model to score videos. You can either:
 
 - Export it directly in your shell:
 
@@ -61,46 +61,17 @@ Set your OpenRouter API key so Youtube Helper can ask the model to score videos.
   export OPENROUTER_API_KEY="sk-or-..."
   ```
 
-- Or use the provided `.env` pattern:
+### 3. Run the app using an activated venv.
 
-  ```bash
-  cp .env.example .env
-  # edit .env and paste your key
-  set -a
-  source .env
-  set +a
-  ```
-
-Optionally, you can set a site URL that OpenRouter will see in the request headers:
-
-```bash
-export OPENROUTER_SITE_URL="http://localhost"
-```
-
-### 3. Run the app
-
-If you activated the `.venv` above:
 
 ```bash
 python app.py
 ```
 
-If you are not using a virtual environment:
-
-```bash
-python3 app.py
-```
-
-By default this opens a small desktop window with two tabs:
+By default, this opens a small desktop window with two tabs:
 
 - Analyze video
 - Recommendations
-
-If you prefer the old-school terminal menu, you can still run:
-
-```bash
-python app.py --cli
-```
 
 ---
 
@@ -111,8 +82,8 @@ python app.py --cli
 1. Choose “Analyze a specific YouTube video” in the menu.
 2. Paste a YouTube link for a video you’re considering.
 3. Answer a few short prompts:
-   - About you – e.g. your background, what kind of content you like or dislike.
-   - What you’re in the mood for – light entertainment, deep dive, cooking inspo, etc.
+   - About you.
+   - What are you in the mood for?
    - Meal length – roughly how many minutes you’ll be eating.
    - Clickbait tolerance – whether spicy titles are okay if the content delivers.
 4. Skim:
@@ -120,13 +91,13 @@ python app.py --cli
    - The clickbait score and explanation.
    - The meal-time verdict tailored specifically for you.
 
-If the verdict says the video is a bad fit (for example, too long for your meal, or fake-drama you hate), you just saved 10–20 minutes of frustration.
+If the verdict says the video is a bad fit (for example, too long for your meal, or fake drama you hate), you just saved 10–20 minutes of frustration.
 
 ### Option 2 – Let it suggest something
 
 1. Choose “Get video recommendations based on your mood”.
-2. Describe what you’re in the mood for (topic, vibe, style).
-3. (Optionally) add a short blurb about yourself so suggestions skew toward your tastes.
+2. Describe what you are in the mood for.
+3. (Optionally) add a short about yourself so suggestions skew toward the user.
 4. Tell it roughly how long each video should be and how many suggestions you’d like.
 5. Skim the list of recommended videos (title, channel, length, URL) and pick one that feels right.
 
