@@ -1,10 +1,15 @@
+"""YouTube Helper: clickbait analysis and video recommendations for meal-time."""
+
+import argparse
+import logging
 import os
+import re
 import shutil
-import sys
 import threading
 from typing import Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -17,8 +22,34 @@ from tkinter import messagebox
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
+load_dotenv()
 
-APP_NAME = "Youtube Helper - Clickbait and Reccomendations"
+APP_NAME = "Youtube Helper - Clickbait and Recommendations"
+
+# --- Config ---
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def is_valid_youtube_url(url: str) -> bool:
+    """Valid YouTube video URL (watch, youtu.be, embed, v/)."""
+    if not url or not url.strip():
+        return False
+    patterns = [
+        r"^https?://(www\.)?youtube\.com/watch\?v=[\w-]+",
+        r"^https?://(www\.)?youtube\.com/embed/[\w-]+",
+        r"^https?://(www\.)?youtube\.com/v/[\w-]+",
+        r"^https?://youtu\.be/[\w-]+",
+    ]
+    return any(re.search(p, url.strip()) for p in patterns)
 
 
 def has_api_key() -> bool:
@@ -57,6 +88,9 @@ def yt_dlp_options() -> Dict:
     return opts
 
 
+# --- YouTube data (yt-dlp, transcripts) ---
+
+
 def get_thumbnail_url(info: Dict) -> Optional[str]:
     thumb = info.get("thumbnail")
     if thumb:
@@ -78,7 +112,8 @@ def get_thumbnail_url(info: Dict) -> Optional[str]:
             resp = requests.head(url, timeout=5)
             if resp.status_code < 400:
                 return url
-        except Exception:
+        except (requests.RequestException, OSError) as e:
+            logger.debug("Thumbnail fetch failed for %s: %s", url, e)
             continue
 
     return None
@@ -90,7 +125,8 @@ def get_video_info(url: str) -> Optional[Dict]:
             info = ydl.extract_info(url, download=False)
             info["thumbnail_resolved"] = get_thumbnail_url(info)
             return info
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch video info: %s", e)
         return None
 
 
@@ -102,8 +138,10 @@ def get_transcript_text(video_id: str) -> str:
         text = " ".join(chunk.get("text", "") for chunk in transcript)
         return text[:12000] if text else ""
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+        logger.debug("No transcript for video %s", video_id)
         return ""
-    except Exception:
+    except Exception as e:
+        logger.debug("Transcript fetch failed for %s: %s", video_id, e)
         return ""
 
 
@@ -135,6 +173,9 @@ def build_video_context(url: str) -> Optional[Dict]:
     }
 
 
+# --- OpenRouter (clickbait analysis, search enhancement) ---
+
+
 def analyze_video_with_openrouter(
     model: str,
     video_ctx: Dict,
@@ -152,11 +193,24 @@ def analyze_video_with_openrouter(
     site_url = os.getenv("OPENROUTER_SITE_URL", "https://youtube-helper.local")
 
     system_prompt = (
-        "You are a YouTube meal-time recommendation assistant and clickbait auditor.\n"
-        "The user is choosing ONE video to watch while eating a meal.\n"
-        "You understand modern YouTube marketing tactics and can distinguish playful, "
-        "attention-grabbing titles from truly misleading or fraudulent ones.\n"
-        "Be concise, practical, and user-focused.\n"
+        "You are a YouTube meal-time recommendation assistant and clickbait auditor. "
+        "The user is choosing ONE video to watch while eating a meal.\n\n"
+        "Your role:\n"
+        "- Evaluate whether the title accurately represents the content. "
+        "Distinguish playful, attention-grabbing titles from truly misleading ones.\n"
+        "- Use the transcript/description as evidence. Do not guess—if the transcript is missing "
+        "or minimal, say so and base your score on title vs description only.\n"
+        "- Be concise and practical. Output only what the user needs to decide.\n\n"
+        "Clickbait rubric (score 1–10):\n"
+        "- 1–3 HONEST: Title matches content. Little or no exaggeration.\n"
+        "- 4–6 EXAGGERATED: Title is marketing-heavy but content mostly delivers.\n"
+        "- 7–9 MISLEADING: Title omits key info or implies something major that isn't there.\n"
+        "- 10 TOTAL FRAUD: Title has almost nothing to do with the actual video.\n\n"
+        "Output format: Use exactly these markdown headings. Be brief under each.\n"
+        "## Summary\n"
+        "## Clickbait Score: X/10\n"
+        "## Evidence\n"
+        "## Meal-Time Verdict\n"
     )
 
     duration_str = (
@@ -182,19 +236,12 @@ def analyze_video_with_openrouter(
     )
 
     instructions = (
-        "Using the information above, think through the analysis silently, then respond with:\n"
-        "1) A 2–3 sentence summary of what the video is actually about.\n"
-        "2) A clickbait score from 1–10 using this rubric:\n"
-        "   - 1–3: HONEST – Title is accurate; very little is exaggerated.\n"
-        "   - 4–6: EXAGGERATED – Title leans marketing-heavy but content mostly delivers.\n"
-        "   - 7–9: MISLEADING – Title omits key info or implies something major that is not there.\n"
-        "   - 10: TOTAL FRAUD – Title has almost nothing to do with the actual video.\n"
-        "3) 1–2 concrete reasons for your score, referring to specific parts of the title vs content.\n"
-        "4) A tailored verdict for THIS user, eating THIS meal, including:\n"
-        "   - Whether it's worth their meal-time.\n"
-        "   - When it might be worth watching anyway (e.g. certain interests, background, or mood).\n"
-        "   - If not ideal, briefly suggest what type of video they should look for instead.\n"
-        "Do not show your intermediate reasoning steps. Respond in clear markdown with headings.\n"
+        "Analyze the video above. Respond with the four sections exactly as specified in the system prompt.\n"
+        "In Evidence: cite specific phrases from the title and compare them to what the transcript says. "
+        "If transcript is missing, say 'No transcript available.' and base the score on title vs description.\n"
+        "In Meal-Time Verdict: give a clear yes/no for this user's meal, and optionally when it might be "
+        "worth watching anyway or what to look for instead. Tailor to their interests and tolerance.\n"
+        "Do not show reasoning steps. Output only the final structured response.\n"
     )
 
     payload = {
@@ -229,13 +276,78 @@ def analyze_video_with_openrouter(
         raise RuntimeError(f"Unexpected OpenRouter response format: {data}")
 
 
+def enhance_search_query_with_ai(
+    mood: str,
+    about_you: str = "",
+    target_minutes: Optional[int] = None,
+) -> str:
+    """Turns vague mood into a better YouTube search query via AI. Falls back to original if no API key."""
+    if not has_api_key():
+        return f"{mood} {about_you}".strip() or mood
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    site_url = os.getenv("OPENROUTER_SITE_URL", "https://youtube-helper.local")
+
+    system_prompt = (
+        "You are a YouTube search query optimizer. Your job is to convert a user's "
+        "vague mood or description into a short, effective YouTube search query.\n\n"
+        "Rules:\n"
+        "- Output ONLY the search query (2-6 keywords), nothing else. No quotes, no explanation.\n"
+        "- Use terms that perform well on YouTube: specific topics, formats (documentary, vlog, "
+        "tutorial, review), and vibes (relaxing, funny, informative).\n"
+        "- If the user mentions duration preference, incorporate it (e.g. 'long form', 'short documentary').\n"
+        "- Keep it concise. YouTube search works best with focused key phrases.\n"
+        "- Do not add extra filler words. Be direct and searchable."
+    )
+
+    user_content = f"Mood/description: {mood}"
+    if about_you:
+        user_content += f"\nUser context (use to refine): {about_you}"
+    if target_minutes:
+        user_content += f"\nPreferred video length: ~{target_minutes} minutes"
+    user_content += "\n\nOutput the optimized YouTube search query:"
+
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": site_url,
+                "X-Title": APP_NAME,
+            },
+            json={
+                "model": MODEL_CHOICES["Standard check (free)"],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 80,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        enhanced = data["choices"][0]["message"]["content"].strip()
+        if enhanced and len(enhanced) < 100:
+            enhanced = enhanced.strip('"\'')
+            logger.debug("Enhanced search query: %s -> %s", mood, enhanced)
+            return enhanced
+    except Exception as e:
+        logger.debug("Search query enhancement failed, using original: %s", e)
+    return f"{mood} {about_you}".strip() or mood
+
+
+# --- Search ---
+
+
 def search_youtube_videos(
     query: str,
     max_results: int = 10,
     target_minutes: Optional[int] = None,
     tolerance_minutes: int = 5,
 ) -> list[Dict]:
-    fetch_count = min(20, max(10, max_results * 2))
+    fetch_count = 30 if target_minutes else min(20, max(10, max_results * 2))  # fetch extra since we filter shorts/livestreams
     search_query = f"ytsearch{fetch_count}:{query}"
     with yt_dlp.YoutubeDL(yt_dlp_options()) as ydl:
         info = ydl.extract_info(search_query, download=False)
@@ -244,10 +356,16 @@ def search_youtube_videos(
     videos: list[Dict] = []
 
     for entry in entries:
+        if entry is None:
+            continue
+        if not (entry.get("webpage_url") or entry.get("url")):
+            continue
+        if entry.get("is_live") or entry.get("was_live"):
+            continue
         duration_seconds = entry.get("duration")
-        duration_minutes = None
-        if duration_seconds:
-            duration_minutes = int(round(duration_seconds / 60))
+        if target_minutes and target_minutes >= 2 and duration_seconds is not None and duration_seconds < 60:
+            continue  # skip shorts when user wants longer videos
+        duration_minutes = int(round(duration_seconds / 60)) if duration_seconds else None
 
         videos.append(
             {
@@ -260,7 +378,7 @@ def search_youtube_videos(
         )
 
     if target_minutes is None:
-        return videos
+        return videos[:max_results]
 
     target_seconds = target_minutes * 60
     tolerance_seconds = tolerance_minutes * 60
@@ -278,7 +396,11 @@ def search_youtube_videos(
             within.append(video)
 
     within.sort(key=lambda v: abs(v["duration_seconds"] - target_seconds))
-    return within + unknown
+    combined = within + unknown
+    return combined[:max_results]
+
+
+# --- CLI ---
 
 
 def prompt_int(prompt: str, default: int, min_value: int, max_value: int) -> int:
@@ -311,6 +433,9 @@ def run_single_video_flow() -> None:
     youtube_url = input("YouTube video link: ").strip()
     if not youtube_url:
         print("You must provide a YouTube URL.")
+        return
+    if not is_valid_youtube_url(youtube_url):
+        print("That doesn't look like a valid YouTube video URL. Please check and try again.")
         return
 
     user_background = input(
@@ -357,7 +482,12 @@ def run_single_video_flow() -> None:
             meal_minutes,
             clickbait_tolerance,
         )
-    except Exception as exc:
+    except requests.RequestException as exc:
+        logger.exception("OpenRouter API request failed")
+        print(f"Could not analyze this video (network error): {exc}")
+        return
+    except (KeyError, ValueError, RuntimeError) as exc:
+        logger.exception("OpenRouter response or config error")
         print(f"Could not analyze this video: {exc}")
         return
 
@@ -374,8 +504,8 @@ def run_recommendation_flow() -> None:
         print("Please describe what you're in the mood for.")
         return
 
-    input(
-        "Tell me a little about you: "
+    about_you = input(
+        "Tell me a little about you (optional): "
     ).strip()
     target_minutes = prompt_int(
         "Roughly how long should each video be (minutes)?", 20, 3, 120
@@ -384,17 +514,17 @@ def run_recommendation_flow() -> None:
         "How many suggestions would you like?", 5, 1, 10
     )
 
-    search_query = mood
-
+    search_query = enhance_search_query_with_ai(mood, about_you, target_minutes)
     print("\nSearching YouTube for matching videos...")
     try:
         videos = search_youtube_videos(
             search_query,
-            max_results=20,
+            max_results=max_results,
             target_minutes=target_minutes,
             tolerance_minutes=5,
         )
     except Exception as exc:
+        logger.exception("Video search failed")
         print(f"Could not search for videos: {exc}")
         return
 
@@ -450,49 +580,72 @@ def run_cli_menu() -> None:
             break
 
 
+# --- GUI ---
+
+
 def launch_gui() -> None:
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("1000x720")
-    root.minsize(900, 640)
+    root.geometry("1080x760")
+    root.minsize(960, 680)
 
-    bg = "#111111"
-    panel_bg = "#181818"
-    accent = "#3b82f6"
-    text_main = "#f5f5f5"
-    text_muted = "#c4c4c4"
+    # Modern dark palette (flat, no gradients)
+    bg = "#0f0f0f"
+    panel_bg = "#1a1a1a"
+    card_bg = "#1f1f1f"
+    input_bg = "#252525"
+    border = "#2e2e2e"
+    border_light = "#383838"
+    accent = "#ff4444"
+    accent_hover = "#ff5555"
+    text_main = "#f0f0f0"
+    text_muted = "#888888"
+    text_dim = "#5a5a5a"
 
     root.configure(bg=bg)
 
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
-    except Exception:
-        pass
+    except tk.TclError:
+        logger.debug("Could not set clam theme, using default")
 
     style.configure(
         "Dark.TFrame",
         background=panel_bg,
     )
     style.configure(
+        "Card.TFrame",
+        background=card_bg,
+    )
+    style.configure(
         "Dark.TLabel",
         background=panel_bg,
         foreground=text_main,
+        font=("Segoe UI", 10),
+    )
+    style.configure(
+        "Card.TLabel",
+        background=card_bg,
+        foreground=text_main,
+        font=("Segoe UI", 10),
     )
     style.configure(
         "Muted.TLabel",
         background=panel_bg,
         foreground=text_muted,
+        font=("Segoe UI", 9),
     )
     style.configure(
         "Dark.TButton",
         background=accent,
-        foreground=text_main,
-        padding=6,
+        foreground="white",
+        padding=(16, 10),
+        font=("Segoe UI", 10, "bold"),
     )
     style.map(
         "Dark.TButton",
-        background=[("active", "#2563eb")],
+        background=[("active", accent_hover)],
     )
     style.configure(
         "Dark.TNotebook",
@@ -503,147 +656,174 @@ def launch_gui() -> None:
         "Dark.TNotebook.Tab",
         background=panel_bg,
         foreground=text_muted,
-        padding=(16, 8),
+        padding=(24, 12),
+        font=("Segoe UI", 10),
     )
     style.map(
         "Dark.TNotebook.Tab",
         background=[("selected", bg)],
         foreground=[("selected", text_main)],
     )
+    style.configure(
+        "Dark.TEntry",
+        fieldbackground=input_bg,
+        foreground=text_main,
+        insertcolor=text_main,
+        padding=8,
+    )
+    style.configure(
+        "Dark.TCombobox",
+        fieldbackground=input_bg,
+        foreground=text_main,
+        background=card_bg,
+        padding=6,
+    )
 
-    header_frame = ttk.Frame(root, style="Dark.TFrame")
-    header_frame.pack(fill="x", padx=12, pady=(10, 0))
+    # Header with bottom border
+    header_frame = tk.Frame(root, bg=panel_bg)
+    header_frame.pack(fill="x", padx=0, pady=0)
+    header_inner = tk.Frame(header_frame, bg=panel_bg)
+    header_inner.pack(fill="x", padx=24, pady=(20, 16))
+    sep = tk.Frame(header_frame, bg=border, height=1)
+    sep.pack(fill="x")
 
-    title_label = ttk.Label(
-        header_frame,
+    title_label = tk.Label(
+        header_inner,
         text=APP_NAME,
-        style="Dark.TLabel",
+        bg=panel_bg,
+        fg=text_main,
         font=("Segoe UI", 16, "bold"),
     )
     title_label.pack(side="left")
 
-    subtitle_label = ttk.Label(
-        header_frame,
-        text="Pick a video quickly, skip the meal-time doom scroll.",
-        style="Muted.TLabel",
+    subtitle_label = tk.Label(
+        header_inner,
+        text="Pick a video quickly, skip the doom scroll.",
+        bg=panel_bg,
+        fg=text_muted,
         font=("Segoe UI", 10),
     )
-    subtitle_label.pack(side="left", padx=(12, 0))
+    subtitle_label.pack(side="left", padx=(20, 0))
 
     notebook = ttk.Notebook(root, style="Dark.TNotebook")
-    notebook.pack(fill="both", expand=True, padx=12, pady=12)
+    notebook.pack(fill="both", expand=True, padx=20, pady=20)
 
     analyze_frame = ttk.Frame(notebook, style="Dark.TFrame")
     recommend_frame = ttk.Frame(notebook, style="Dark.TFrame")
-    notebook.add(analyze_frame, text="Analyze video")
-    notebook.add(recommend_frame, text="Recommendations")
+    notebook.add(analyze_frame, text="  Analyze  ")
+    notebook.add(recommend_frame, text="  Discover  ")
 
     analyze_frame.columnconfigure(0, weight=1)
     analyze_frame.columnconfigure(1, weight=2)
 
-    analyze_left = ttk.Frame(analyze_frame, style="Dark.TFrame", padding=(8, 8, 8, 8))
+    analyze_left = ttk.Frame(analyze_frame, style="Dark.TFrame", padding=(20, 20, 20, 20))
     analyze_left.grid(row=0, column=0, sticky="nsew")
 
-    analyze_right = ttk.Frame(analyze_frame, style="Dark.TFrame", padding=(8, 8, 8, 8))
+    analyze_right = ttk.Frame(analyze_frame, style="Dark.TFrame", padding=(20, 20, 20, 20))
     analyze_right.grid(row=0, column=1, sticky="nsew")
     analyze_right.rowconfigure(1, weight=1)
     analyze_right.columnconfigure(0, weight=1)
 
     url_label = ttk.Label(analyze_left, text="YouTube video link", style="Dark.TLabel")
-    url_label.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
+    url_label.grid(row=0, column=0, sticky="w", padx=0, pady=(0, 4))
     url_var = tk.StringVar()
-    url_entry = ttk.Entry(analyze_left, textvariable=url_var, width=60)
-    url_entry.grid(row=1, column=0, sticky="we", padx=5, pady=(0, 8))
+    url_entry = ttk.Entry(analyze_left, textvariable=url_var, width=50, style="Dark.TEntry")
+    url_entry.grid(row=1, column=0, sticky="we", padx=0, pady=(0, 12))
 
     about_label = ttk.Label(
         analyze_left,
         text="About you (optional)",
         style="Dark.TLabel",
     )
-    about_label.grid(row=2, column=0, sticky="w", padx=5, pady=(4, 2))
+    about_label.grid(row=2, column=0, sticky="w", padx=0, pady=(8, 4))
     about_text = tk.Text(
         analyze_left,
-        height=4,
-        width=40,
-        background=bg,
+        height=3,
+        width=42,
+        background=input_bg,
         foreground=text_main,
         insertbackground=text_main,
         borderwidth=1,
-        relief="solid",
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=border,
     )
-    about_text.grid(row=3, column=0, sticky="we", padx=5, pady=(0, 8))
+    about_text.grid(row=3, column=0, sticky="we", padx=0, pady=(0, 12))
 
     mood_label = ttk.Label(
         analyze_left,
         text="What you're in the mood for",
         style="Dark.TLabel",
     )
-    mood_label.grid(row=4, column=0, sticky="w", padx=5, pady=(4, 2))
+    mood_label.grid(row=4, column=0, sticky="w", padx=0, pady=(8, 4))
     mood_text = tk.Text(
         analyze_left,
-        height=4,
-        width=40,
-        background=bg,
+        height=3,
+        width=42,
+        background=input_bg,
         foreground=text_main,
         insertbackground=text_main,
         borderwidth=1,
-        relief="solid",
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=border,
     )
-    mood_text.grid(row=5, column=0, sticky="we", padx=5, pady=(0, 8))
+    mood_text.grid(row=5, column=0, sticky="we", padx=0, pady=(0, 12))
 
     meal_label = ttk.Label(
         analyze_left,
         text="Meal length (minutes):",
         style="Dark.TLabel",
     )
-    meal_label.grid(row=6, column=0, sticky="w", padx=5, pady=(4, 2))
+    meal_label.grid(row=6, column=0, sticky="w", padx=0, pady=(8, 4))
     meal_var = tk.IntVar(value=20)
     meal_spin = ttk.Spinbox(
-        analyze_left, from_=5, to=60, increment=5, textvariable=meal_var, width=6
+        analyze_left, from_=5, to=60, increment=5, textvariable=meal_var, width=8
     )
-    meal_spin.grid(row=7, column=0, sticky="w", padx=5, pady=(0, 4))
+    meal_spin.grid(row=7, column=0, sticky="w", padx=0, pady=(0, 12))
 
     tol_label = ttk.Label(
         analyze_left,
         text="Clickbait tolerance (1 = honest only, 10 = okay with spicy titles):",
         style="Dark.TLabel",
-        wraplength=420,
+        wraplength=380,
         justify="left",
     )
-    tol_label.grid(row=8, column=0, sticky="w", padx=5, pady=(6, 2))
+    tol_label.grid(row=8, column=0, sticky="w", padx=0, pady=(8, 4))
     tol_var = tk.IntVar(value=4)
     tol_spin = ttk.Spinbox(
-        analyze_left, from_=1, to=10, increment=1, textvariable=tol_var, width=6
+        analyze_left, from_=1, to=10, increment=1, textvariable=tol_var, width=8
     )
-    tol_spin.grid(row=9, column=0, sticky="w", padx=5, pady=(0, 8))
+    tol_spin.grid(row=9, column=0, sticky="w", padx=0, pady=(0, 12))
 
     model_label = ttk.Label(analyze_left, text="Analysis style", style="Dark.TLabel")
-    model_label.grid(row=10, column=0, sticky="w", padx=5, pady=(4, 2))
+    model_label.grid(row=10, column=0, sticky="w", padx=0, pady=(8, 4))
     model_var = tk.StringVar(value=list(MODEL_CHOICES.keys())[0])
     model_combo = ttk.Combobox(
         analyze_left,
         textvariable=model_var,
         values=list(MODEL_CHOICES.keys()),
         state="readonly",
-        width=30,
+        width=28,
+        style="Dark.TCombobox",
     )
-    model_combo.grid(row=11, column=0, sticky="we", padx=5, pady=(0, 10))
+    model_combo.grid(row=11, column=0, sticky="we", padx=0, pady=(0, 16))
 
     analyze_button = ttk.Button(
         analyze_left,
         text="Analyze video",
         style="Dark.TButton",
     )
-    analyze_button.grid(row=12, column=0, sticky="we", padx=5, pady=(0, 4))
+    analyze_button.grid(row=12, column=0, sticky="we", padx=0, pady=(0, 8))
 
     hint_label = ttk.Label(
         analyze_left,
         text="Paste a link, add a bit of context, then hit Analyze.",
         style="Muted.TLabel",
-        wraplength=360,
+        wraplength=380,
         justify="left",
     )
-    hint_label.grid(row=13, column=0, sticky="w", padx=5, pady=(0, 4))
+    hint_label.grid(row=13, column=0, sticky="w", padx=0, pady=(0, 4))
 
     for col in range(1):
         analyze_left.columnconfigure(col, weight=1)
@@ -654,19 +834,24 @@ def launch_gui() -> None:
         style="Dark.TLabel",
         font=("Segoe UI", 11, "bold"),
     )
-    analysis_title.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 4))
+    analysis_title.grid(row=0, column=0, sticky="w", padx=0, pady=(0, 8))
 
     result_box = ScrolledText(
         analyze_right,
         wrap="word",
         height=20,
-        background=bg,
+        background=input_bg,
         foreground=text_main,
         insertbackground=text_main,
-        borderwidth=1,
-        relief="solid",
+        borderwidth=0,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=border,
+        font=("Segoe UI", 10),
     )
-    result_box.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+    result_box.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 8))
+    result_box.insert("1.0", "Paste a YouTube link and click Analyze to see the clickbait score and meal-time verdict here.")
+    result_box.configure(fg=text_dim)
 
     def apply_analyze_results(
         video_ctx: Optional[Dict],
@@ -678,7 +863,8 @@ def launch_gui() -> None:
             msg = "Analysis was cancelled." if isinstance(error, KeyboardInterrupt) else str(error)
             messagebox.showerror("Analysis error", f"Could not analyze this video: {msg}")
             result_box.delete("1.0", "end")
-            result_box.insert("end", "Analysis was cancelled or failed. Try again when ready.\n")
+            result_box.insert("1.0", "Paste a YouTube link and click Analyze to see the clickbait score and meal-time verdict here.")
+            result_box.configure(fg=text_dim)
             return
         if not video_ctx or not analysis:
             messagebox.showerror(
@@ -686,8 +872,11 @@ def launch_gui() -> None:
                 "Could not load video metadata. Please check the URL and try again.",
             )
             result_box.delete("1.0", "end")
+            result_box.insert("1.0", "Paste a YouTube link and click Analyze to see the clickbait score and meal-time verdict here.")
+            result_box.configure(fg=text_dim)
             return
         result_box.delete("1.0", "end")
+        result_box.configure(fg=text_main)
         header_lines = [
             f"Title  : {video_ctx.get('title') or 'Unknown'}",
             f"Channel: {video_ctx.get('channel') or 'Unknown'}",
@@ -703,6 +892,12 @@ def launch_gui() -> None:
         url = url_var.get().strip()
         if not url:
             messagebox.showerror("Missing URL", "Please paste a YouTube video link first.")
+            return
+        if not is_valid_youtube_url(url):
+            messagebox.showerror(
+                "Invalid URL",
+                "That doesn't look like a valid YouTube video URL. Please check and try again.",
+            )
             return
         user_background = about_text.get("1.0", "end").strip()
         user_interests = mood_text.get("1.0", "end").strip()
@@ -752,10 +947,10 @@ def launch_gui() -> None:
     recommend_frame.columnconfigure(0, weight=1)
     recommend_frame.columnconfigure(1, weight=2)
 
-    recommend_left = ttk.Frame(recommend_frame, style="Dark.TFrame", padding=(8, 8, 8, 8))
+    recommend_left = ttk.Frame(recommend_frame, style="Dark.TFrame", padding=(16, 16, 16, 16))
     recommend_left.grid(row=0, column=0, sticky="nsew")
 
-    recommend_right = ttk.Frame(recommend_frame, style="Dark.TFrame", padding=(8, 8, 8, 8))
+    recommend_right = ttk.Frame(recommend_frame, style="Dark.TFrame", padding=(16, 16, 16, 16))
     recommend_right.grid(row=0, column=1, sticky="nsew")
     recommend_right.rowconfigure(1, weight=1)
     recommend_right.columnconfigure(0, weight=1)
@@ -765,60 +960,60 @@ def launch_gui() -> None:
         text="What are you in the mood for?",
         style="Dark.TLabel",
     )
-    mood_label2.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
+    mood_label2.grid(row=0, column=0, sticky="w", padx=0, pady=(0, 4))
     mood_var2 = tk.StringVar()
-    mood_entry2 = ttk.Entry(recommend_left, textvariable=mood_var2, width=60)
-    mood_entry2.grid(row=1, column=0, sticky="we", padx=5, pady=(0, 8))
+    mood_entry2 = ttk.Entry(recommend_left, textvariable=mood_var2, width=50, style="Dark.TEntry")
+    mood_entry2.grid(row=1, column=0, sticky="we", padx=0, pady=(0, 12))
 
     about_label2 = ttk.Label(
         recommend_left,
-        text="About you (optional; used only to break ties between similar options):",
+        text="About you (optional)",
         style="Dark.TLabel",
     )
-    about_label2.grid(row=2, column=0, sticky="w", padx=5, pady=(4, 2))
+    about_label2.grid(row=2, column=0, sticky="w", padx=0, pady=(8, 4))
     about_var2 = tk.StringVar()
-    about_entry2 = ttk.Entry(recommend_left, textvariable=about_var2, width=60)
-    about_entry2.grid(row=3, column=0, sticky="we", padx=5, pady=(0, 8))
+    about_entry2 = ttk.Entry(recommend_left, textvariable=about_var2, width=50, style="Dark.TEntry")
+    about_entry2.grid(row=3, column=0, sticky="we", padx=0, pady=(0, 12))
 
     target_label = ttk.Label(
         recommend_left,
         text="Target video length (minutes):",
         style="Dark.TLabel",
     )
-    target_label.grid(row=4, column=0, sticky="w", padx=5, pady=(4, 2))
+    target_label.grid(row=4, column=0, sticky="w", padx=0, pady=(8, 4))
     target_var = tk.IntVar(value=20)
     target_spin = ttk.Spinbox(
-        recommend_left, from_=3, to=120, increment=1, textvariable=target_var, width=6
+        recommend_left, from_=3, to=120, increment=1, textvariable=target_var, width=8
     )
-    target_spin.grid(row=5, column=0, sticky="w", padx=5, pady=(0, 4))
+    target_spin.grid(row=5, column=0, sticky="w", padx=0, pady=(0, 12))
 
     count_label = ttk.Label(
         recommend_left,
         text="Number of suggestions:",
         style="Dark.TLabel",
     )
-    count_label.grid(row=6, column=0, sticky="w", padx=5, pady=(4, 2))
+    count_label.grid(row=6, column=0, sticky="w", padx=0, pady=(8, 4))
     count_var = tk.IntVar(value=5)
     count_spin = ttk.Spinbox(
-        recommend_left, from_=1, to=10, increment=1, textvariable=count_var, width=6
+        recommend_left, from_=1, to=10, increment=1, textvariable=count_var, width=8
     )
-    count_spin.grid(row=7, column=0, sticky="w", padx=5, pady=(0, 8))
+    count_spin.grid(row=7, column=0, sticky="w", padx=0, pady=(0, 16))
 
     recommend_button = ttk.Button(
         recommend_left,
         text="Get recommendations",
         style="Dark.TButton",
     )
-    recommend_button.grid(row=8, column=0, sticky="we", padx=5, pady=(0, 4))
+    recommend_button.grid(row=8, column=0, sticky="we", padx=0, pady=(0, 8))
 
     hint_label2 = ttk.Label(
         recommend_left,
         text="Describe the vibe and how long you want to watch, then hit Get recommendations.",
         style="Muted.TLabel",
-        wraplength=360,
+        wraplength=380,
         justify="left",
     )
-    hint_label2.grid(row=9, column=0, sticky="w", padx=5, pady=(0, 4))
+    hint_label2.grid(row=9, column=0, sticky="w", padx=0, pady=(0, 4))
 
     for col in range(1):
         recommend_left.columnconfigure(col, weight=1)
@@ -829,19 +1024,24 @@ def launch_gui() -> None:
         style="Dark.TLabel",
         font=("Segoe UI", 11, "bold"),
     )
-    reco_title.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 4))
+    reco_title.grid(row=0, column=0, sticky="w", padx=0, pady=(0, 8))
 
     reco_box = ScrolledText(
         recommend_right,
         wrap="word",
         height=20,
-        background=bg,
+        background=input_bg,
         foreground=text_main,
         insertbackground=text_main,
-        borderwidth=1,
-        relief="solid",
+        borderwidth=0,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=border,
+        font=("Segoe UI", 10),
     )
-    reco_box.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+    reco_box.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 8))
+    reco_box.insert("1.0", "Describe what you want to watch and click Get recommendations. Results will appear here.")
+    reco_box.configure(fg=text_dim)
 
     def apply_recommend_results(
         videos: Optional[List[Dict]], error: Optional[BaseException], n: int
@@ -851,12 +1051,14 @@ def launch_gui() -> None:
             msg = "Search was cancelled." if isinstance(error, KeyboardInterrupt) else str(error)
             messagebox.showerror("Search error", f"Could not search for videos: {msg}")
             reco_box.delete("1.0", "end")
-            reco_box.insert("end", "Search was cancelled or failed. Try again when ready.\n")
+            reco_box.insert("1.0", "Describe what you want to watch and click Get recommendations. Results will appear here.")
+            reco_box.configure(fg=text_dim)
             return
         reco_box.delete("1.0", "end")
+        reco_box.configure(fg=text_main)
         if not videos:
             reco_box.insert(
-                "end",
+                "1.0",
                 "No videos matched your description and length preference.\n"
                 "Try broadening your description or loosening the length requirement.",
             )
@@ -896,7 +1098,8 @@ def launch_gui() -> None:
             return
         target_minutes = target_var.get()
         max_results = count_var.get()
-        search_query = mood
+        about_you = about_var2.get().strip()
+        search_query = enhance_search_query_with_ai(mood, about_you, target_minutes)
 
         reco_box.delete("1.0", "end")
         reco_box.insert("end", "Searching YouTube for matching videos...\n")
@@ -908,7 +1111,7 @@ def launch_gui() -> None:
             try:
                 out = search_youtube_videos(
                     search_query,
-                    max_results=20,
+                    max_results=max_results,
                     target_minutes=target_minutes,
                     tolerance_minutes=5,
                 )
@@ -923,14 +1126,42 @@ def launch_gui() -> None:
     root.mainloop()
 
 
+# --- Entry point ---
+
+
 def main() -> None:
-    if "--cli" in sys.argv:
+    parser = argparse.ArgumentParser(
+        prog="youtube-helper",
+        description="YouTube meal-time recommendation assistant and clickbait auditor.",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Use CLI instead of GUI (useful when GUI cannot start)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose (debug) logging",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s 0.1.0",
+    )
+    args = parser.parse_args()
+
+    _setup_logging(verbose=args.verbose)
+
+    if args.cli:
         run_cli_menu()
         return
 
     try:
         launch_gui()
-    except Exception:
+    except Exception as e:
+        logger.warning("GUI failed to start (%s), falling back to CLI", e)
         run_cli_menu()
 
 
