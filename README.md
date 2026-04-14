@@ -91,5 +91,3 @@ If the verdict says the video is a bad fit (too long for your meal, or fake dram
 5. Skim the list and pick one that feels right.
 
 You can copy any URL from the recommendation list back into the "Analyze a specific YouTube video" flow to get the same clickbait score and meal-time verdict.
-
-(currently broken due to depreciated dependencies)
